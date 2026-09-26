@@ -1,0 +1,28 @@
+# Ignore virtual environment directories
+.env
+.venv
+
+# Ignore IDE configuration files
+.idea/
+.vscode/
+
+# Ignore __pycache__ directories
+**/__pycache__/
+
+# Ignore temporary files
+*.tmp
+*.swp
+
+# Ignore build artifacts
+node_modules/
+.expo/
+dist/
+web-build/
+
+# Claude Code
+.claude/settings.local.json
+
+# Off
+privacy/README.md
+icons/
+collections/

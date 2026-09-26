@@ -1,0 +1,191 @@
+services:
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      # porta para clientes rodando no host (Python, PyCharm, CLI)
+      - "9092:9092"
+    environment:
+      # --- modo KRaft (sem Zookeeper): o mesmo nó e broker e controller ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+
+      # --- listeners ---
+      # PLAINTEXT      -> trafego entre containers  (kafka:29092)
+      # PLAINTEXT_HOST -> trafego vindo do Windows  (localhost:9092)
+      # CONTROLLER     -> quorum interno do KRaft
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # --- ajustes de cluster de um no so ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # topicos criados automaticamente nascem com 3 particoes, senao
+      # "--scale" em um consumer group nao teria o que distribuir
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # Interface web opcional: docker compose --profile ui up -d
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    container_name: kafka-ui
+    profiles: ["ui"]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Servicos da aplicacao — todos no profile "apps", para que um
+  # "docker compose up -d" continue subindo apenas o broker (fluxo de
+  # desenvolvimento local, rodando os .py pelo venv do PyCharm).
+  #
+  #   docker compose --profile apps up -d --build
+  #
+  # Dentro da rede do compose o broker atende em kafka:29092 — "localhost"
+  # aqui seria o proprio container, nao o Kafka.
+  # ---------------------------------------------------------------------
+
+  producer:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    image: protocolo/producer:dev
+    profiles: ["apps"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+    restart: unless-stopped
+
+  consumer_notificacao_cliente:
+    build:
+      context: .
+      dockerfile: consumer_notificacao_cliente/Dockerfile
+    image: protocolo/notificacao-cliente:dev
+    profiles: ["apps"]
+    # 3 instancias para 3 particoes -> divisao 1:1, paralelismo maximo
+    # dentro do grupo. Servico sem estado, entao escalar e seguro.
+    deploy:
+      replicas: 3
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+      GROUP_ID: grupo-notificacao-cliente
+    restart: unless-stopped
+
+  consumer_notificacao_interna:
+    build:
+      context: .
+      dockerfile: consumer_notificacao_interna/Dockerfile
+    image: protocolo/notificacao-interna:dev
+    profiles: ["apps"]
+    # 2 instancias para 3 particoes -> divisao DESIGUAL: uma instancia fica
+    # com 2 particoes e a outra com 1. O Kafka nao exige numero redondo.
+    deploy:
+      replicas: 2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+      GROUP_ID: grupo-notificacao-interna
+    restart: unless-stopped
+
+  consumer_estoque:
+    build:
+      context: .
+      dockerfile: consumer_estoque/Dockerfile
+    image: protocolo/estoque:dev
+    profiles: ["apps"]
+    # 1 instancia DE PROPOSITO: o dict ESTOQUE vive na memoria do processo.
+    # Com N instancias cada uma teria seu proprio catalogo de 80 teclados,
+    # e as contagens impressas deixariam de significar alguma coisa.
+    deploy:
+      replicas: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+      GROUP_ID: grupo-estoque
+    restart: unless-stopped
+
+  consumer_analytics:
+    build:
+      context: .
+      dockerfile: consumer_analytics/Dockerfile
+    image: protocolo/analytics:dev
+    profiles: ["apps"]
+    # 1 instancia DE PROPOSITO: faturamento_total e total_pedidos sao
+    # acumuladores em memoria do processo (mesmo motivo do estoque).
+    # Com N instancias voce veria N faturamentos parciais, nenhum o total.
+    deploy:
+      replicas: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+      GROUP_ID: grupo-analytics
+    restart: unless-stopped
+
+  consumer_auditoria:
+    build:
+      context: .
+      dockerfile: consumer_auditoria/Dockerfile
+    image: protocolo/auditoria:dev
+    profiles: ["apps"]
+    # 1 instancia DE PROPOSITO: todas escreveriam no mesmo auditoria.jsonl
+    # atraves do bind mount do Windows, onde a atomicidade do append nao e
+    # garantida como seria num filesystem Linux nativo.
+    deploy:
+      replicas: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_NAME: reservas-pedido
+      GROUP_ID: grupo-auditoria
+      # sem isso o codigo resolveria para /data (fora do WORKDIR)
+      AUDITORIA_ARQUIVO: /app/data/auditoria.jsonl
+    volumes:
+      # bind mount: o auditoria.jsonl fica visivel em .\data no Windows
+      - ./data:/app/data
+    restart: unless-stopped
+
+volumes:
+  kafka_data:

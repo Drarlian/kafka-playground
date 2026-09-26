@@ -1,0 +1,18 @@
+# O contexto de build e a raiz do projeto, entao tudo que nao for codigo
+# precisa ficar de fora (o .venv sozinho tornaria o build lento e inutilmente grande).
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+data/
+*.jsonl
+
+.git/
+.gitignore
+.idea/
+.vscode/
+
+docker-compose.yml
+*.md
