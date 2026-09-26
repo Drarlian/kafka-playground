@@ -23,6 +23,19 @@ PRODUTOS = [
 
 CLIENTES = [f"cliente-{i:03d}" for i in range(1, 31)]
 
+# Produtos que NAO existem no catalogo do consumer_estoque. Servem para
+# exercitar o caminho de erro permanente -> DLQ naquele servico.
+#
+# Os outros 4 consumers lidam com eles normalmente: so o estoque mantem um
+# catalogo proprio e valida contra ele. Um produto desconhecido e um erro para
+# o inventario, e um pedido comum para quem so notifica ou audita.
+PRODUTOS_FORA_DE_CATALOGO = [
+    ("item-descontinuado", 99.00),
+    ("produto-fantasma", 150.00),
+]
+
+PCT_FORA_DE_CATALOGO = float(os.environ.get("PCT_FORA_DE_CATALOGO", "10"))
+
 
 def delivery_report(err, msg):
     if err is not None:
@@ -35,7 +48,11 @@ def delivery_report(err, msg):
 
 
 def gerar_reserva_pedido() -> dict:
-    produto, preco_unitario = random.choice(PRODUTOS)
+    if random.uniform(0, 100) < PCT_FORA_DE_CATALOGO:
+        produto, preco_unitario = random.choice(PRODUTOS_FORA_DE_CATALOGO)
+    else:
+        produto, preco_unitario = random.choice(PRODUTOS)
+
     quantidade = random.randint(1, 5)
     return {
         "evento": "reserva_pedido_criada",

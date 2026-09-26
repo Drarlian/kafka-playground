@@ -40,7 +40,7 @@ necessários no mesmo evento.
 | `producer`                     | Gera e publica reservas de pedido simuladas                 | —                         |
 | `consumer_notificacao_cliente` | Simula envio de e-mail/SMS confirmando a reserva ao cliente  | `grupo-notificacao-cliente`|
 | `consumer_notificacao_interna` | Simula alerta para a equipe de vendas/logística              | `grupo-notificacao-interna`|
-| `consumer_estoque`             | Reserva a quantidade pedida no inventário (com controle de estoque insuficiente) | `grupo-estoque` |
+| `consumer_estoque`             | Reserva a quantidade pedida no inventário (com controle de estoque insuficiente, commit manual e DLQ) | `grupo-estoque` |
 | `consumer_analytics`           | Agrega faturamento acumulado e ranking de produtos           | `grupo-analytics`         |
 | `consumer_auditoria`           | Grava cada evento em `data/auditoria.jsonl`                  | `grupo-auditoria`         |
 
@@ -162,6 +162,48 @@ Todos os serviços aceitam (com valores padrão já prontos para uso local):
 
 `consumer_auditoria` também aceita `AUDITORIA_ARQUIVO` para trocar o caminho
 do arquivo de log (padrão: `data/auditoria.jsonl` na raiz do projeto).
+
+### Tratamento de erro e DLQ
+
+`consumer_estoque` é o único consumer com **commit manual de offset e dead
+letter queue** — os outros 4 usam auto-commit, para o contraste ficar visível
+lado a lado. Os conceitos estão em
+[CONCEITOS-KAFKA.md](CONCEITOS-KAFKA.md#reprocessamento-erros-e-dead-letter-queue).
+
+Para as duas trilhas de erro acontecerem de verdade existem falhas simuladas,
+todas desligáveis:
+
+| Variável                 | Serviço    | Padrão                 | Efeito                                              |
+|--------------------------|------------|------------------------|-----------------------------------------------------|
+| `PCT_FORA_DE_CATALOGO`   | producer   | `10`                   | % de pedidos com produto inexistente → erro permanente |
+| `FALHA_TRANSITORIA_PCT`  | estoque    | `15`                   | % de consultas ao inventário que falham → erro transitório |
+| `MAX_TENTATIVAS`         | estoque    | `3`                    | tentativas antes de mandar para a DLQ               |
+| `DLQ_TOPIC`              | estoque    | `reservas-pedido.dlq`  | tópico onde as mensagens são estacionadas           |
+
+Zerando `PCT_FORA_DE_CATALOGO` e `FALHA_TRANSITORIA_PCT` no
+[docker-compose.yml](docker-compose.yml) o sistema roda sem falha nenhuma.
+
+Os produtos fora de catálogo **só** são erro para o estoque — os outros 4
+consumers processam essas mensagens normalmente. Um produto desconhecido é
+problema de quem mantém inventário, não de quem notifica ou audita.
+
+O fluxo de erro tem testes que rodam **sem precisar do Kafka** — usam dublês no
+lugar da mensagem e do producer da DLQ:
+
+```powershell
+.venv\Scripts\python consumer_estoque\teste_dlq.py
+```
+
+São 7 cenários (sucesso, erro permanente, JSON inválido, transitório que
+esgota, transitório que se recupera, DLQ que não confirma a escrita, e
+idempotência). Servem tanto de verificação quanto de documentação executável
+do contrato de `tratar()`.
+
+Para ver as mensagens estacionadas, com os headers de diagnóstico:
+
+```powershell
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic reservas-pedido.dlq --from-beginning --property print.headers=true
+```
 
 ## Verificando via Kafka UI
 

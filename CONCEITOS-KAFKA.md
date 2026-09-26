@@ -395,6 +395,243 @@ atomicidade do append não é garantida como seria num filesystem Linux nativo.
 A lição embutida: **o teto de escala de um consumer é definido pelo próprio
 serviço, não pelo Kafka.** O broker ofereceu 3 partições a todos igualmente.
 
+## Reprocessamento, erros e dead letter queue
+
+O offset explica como um grupo **retoma** de onde parou. Falta a pergunta mais
+difícil: o que acontece quando uma mensagem específica não pode ser
+processada?
+
+### Quem decide o avanço do offset
+
+Tudo depende de uma configuração só:
+
+```python
+"enable.auto.commit": True      # o cliente commita sozinho, a cada 5s
+"enable.auto.commit": False     # o seu código decide quando
+```
+
+Com auto-commit, o que é commitado são os offsets das mensagens **que o
+`poll()` entregou** — não das que foram processadas com sucesso. O resultado
+do processamento não participa da decisão.
+
+É o que os 4 consumers simples deste projeto fazem, e a consequência é
+concreta: se `processar()` lançar uma exceção, ela sobe, o `finally` chama
+`consumer.close()`, e o `close()` faz um commit final dos offsets entregues. O
+processo morre, o Docker reinicia pelo `restart: unless-stopped`, e o consumer
+volta posicionado **depois** da mensagem que quebrou.
+
+A mensagem foi perdida, em silêncio. Isso é **at-most-once**: no máximo uma
+vez, possivelmente nenhuma.
+
+### O trade-off
+
+| | Auto-commit | Commit manual após sucesso |
+|---|---|---|
+| Mensagem que falha | **perdida** silenciosamente | **nunca perdida** |
+| Risco | perda | **travamento** |
+| Semântica | at-most-once | at-least-once |
+
+Não existe uma terceira coluna de graça. A DLQ é o que permite sair dessa
+dicotomia.
+
+### Por que a mensagem "morta" trava
+
+O motivo é estrutural: **o offset é um número só por partição.** Não existe
+"processei o 42 e o 44, mas não o 43" — commitar 44 declara implicitamente que
+tudo até ali foi consumido.
+
+Então uma mensagem que sempre falha no offset 43 impede o avanço de tudo que
+está atrás dela naquela partição. É *head-of-line blocking*.
+
+E como o loop é single-threaded, retentar ali dentro para **a instância
+inteira**, não só aquela partição: enquanto o código tenta o offset 43, ele
+não chama `poll()`, e as outras partições daquela instância também ficam
+paradas.
+
+### A armadilha do `max.poll.interval.ms`
+
+São dois relógios diferentes vigiando o consumer:
+
+| Config | O que mede | Quem responde |
+|---|---|---|
+| `session.timeout.ms` | heartbeats | thread em segundo plano |
+| `max.poll.interval.ms` | tempo entre chamadas de `poll()` | a sua aplicação |
+
+A thread de heartbeat continua batendo mesmo com a aplicação travada, então
+não é ela que dispara. Quem dispara é o `max.poll.interval.ms` (padrão: 5
+minutos). Se um retry com backoff demorar mais que isso, o broker conclui que
+o consumer parou de progredir e o remove do grupo.
+
+O detalhe que fecha o ciclo: **ser expulso não mata o processo.** Na próxima
+chamada de `poll()` o cliente percebe a remoção e reingressa sozinho, o que
+dispara mais um rebalanceamento:
+
+```
+instancia trava na mensagem 43
+      ↓  estoura max.poll.interval.ms
+expulsa do grupo  ──▶  rebalanceamento
+      ↓
+particao vai para outra instancia, que trava na MESMA mensagem
+      ↓
+enquanto isso a primeira chamou poll() e REINGRESSOU  ──▶  rebalanceamento
+      ↓
+a particao volta a circular...
+```
+
+O pool nunca esvazia porque ninguém morre de verdade. O ciclo se sustenta
+enquanto a causa se sustentar — não é uma propriedade do Kafka, é consequência
+de o processamento continuar estourando o intervalo.
+
+Num rebalanceamento clássico (*eager*) todas as instâncias do grupo revogam
+suas partições e esperam a nova atribuição, então uma única mensagem congela
+o grupo inteiro periodicamente. Com `cooperative-sticky` o rebalanceamento é
+incremental e o raio é bem menor.
+
+### Dead letter queue
+
+Primeiro: **o Kafka não tem DLQ nativa.** Diferente de SQS ou RabbitMQ, não
+existe configuração de "depois de N tentativas mande para cá". Kafka Connect e
+Spring Kafka implementam por cima; em `confluent-kafka` puro você constrói — e
+a construção é simples, porque a DLQ é só **outro tópico**.
+
+A regra que ela estabelece: *tente algumas vezes; se não der, estacione a
+mensagem em outro lugar, commite o offset e siga.* Converte "travar para
+sempre" em "isolar e continuar".
+
+### Transitório vs. permanente
+
+Esta é a decisão central do desenho, e onde a maioria das implementações erra.
+
+- **Transitório** — timeout de banco, rede instável, serviço fora do ar. Vai
+  funcionar daqui a pouco. **Retentar faz sentido.**
+- **Permanente** — JSON malformado, campo ausente, regra de negócio violada.
+  Vai falhar idêntico na milésima tentativa. **Retentar é desperdício** — e
+  pior, segura a partição enquanto isso.
+
+Tratar os dois igual causa os dois problemas ao mesmo tempo: você bloqueia por
+erros que nunca vão passar, e descarta na DLQ coisas que teriam funcionado
+sozinhas em 10 segundos.
+
+Uma terceira categoria que não é erro nenhum e costuma ser confundida:
+**desfecho de negócio previsto**. "Estoque insuficiente" não é falha — a
+mensagem foi processada corretamente, o pedido apenas não pôde ser atendido.
+Mandar isso para a DLQ é confundir *falhou* com *deu não*.
+
+### O que gravar na mensagem da DLQ
+
+Mandar só o payload transforma a DLQ num cemitério que ninguém consegue
+investigar. O mínimo útil:
+
+| Header | Para quê |
+|---|---|
+| `erro` / `erro_tipo` | diagnosticar sem reproduzir |
+| `topico_origem` / `particao_origem` / `offset_origem` | achar a mensagem original |
+| `consumer_group` | saber *qual* consumer falhou (os outros podem ter tido sucesso) |
+| `tentativas` | distinguir "falhou na hora" de "insistiu e não foi" |
+| `falhou_em` | correlacionar com incidentes |
+
+O payload vai **intacto**, porque a DLQ precisa ser reprocessável: depois de
+corrigir a causa, um replay republica a mensagem no tópico de origem. Se você
+a transformou ao gravar, esse replay deixa de ser possível.
+
+E uma ordem que não é detalhe: **confirme a escrita na DLQ antes de commitar o
+offset**. Commitar primeiro e falhar ao gravar apaga a mensagem dos dois
+lugares.
+
+Confirmar exige atenção, porque `produce()` é **assíncrono** — ele só enfileira
+a mensagem num buffer local do cliente, e uma thread em segundo plano despacha
+depois. Quando `produce()` retorna, a mensagem pode nem ter saído da máquina.
+Quem espera a confirmação do broker é o `flush()`, e ele **devolve quantas
+mensagens ficaram pendentes**: qualquer valor diferente de zero significa que a
+escrita não se completou, e aí o offset não pode avançar. Ignorar esse retorno
+é o mesmo que não ter feito o flush.
+
+### Retry topics: retentar sem bloquear
+
+Quando o retry precisa ser longo (minutos, horas), retentar dentro do loop é
+inviável por causa do `max.poll.interval.ms`. O padrão é escalonar em tópicos:
+
+```
+reservas-pedido ──falhou──▶ retry-5s ──falhou──▶ retry-5m ──falhou──▶ dlq
+```
+
+Cada tópico de retry tem seu próprio consumer, que espera o intervalo antes de
+processar. O tópico principal nunca fica bloqueado: a mensagem problemática
+saiu dele imediatamente.
+
+### Duas tensões que a DLQ cria
+
+**Ordem.** Se você keya por entidade para garantir ordem e o evento 2 vai para
+a DLQ enquanto o 3 é processado normalmente, a garantia foi quebrada — e o
+replay posterior reintroduz o evento 2 fora de sequência. Para fluxos onde a
+ordem é semântica (criado → cancelado), às vezes bloquear é *mais correto* que
+seguir em frente.
+
+**Duplicação.** Commit manual após o sucesso é at-least-once: se o processo
+morre entre o `processar()` e o `commit()`, a mensagem volta. O processamento
+precisa ser idempotente.
+
+### Neste projeto
+
+`consumer_estoque` é o único consumer com commit manual e DLQ — os outros 4
+ficaram com auto-commit de propósito, para o contraste ser visível lado a
+lado. O fluxo implementado:
+
+```
+poll ──▶ JSON invalido?        ──▶ DLQ direto (0 tentativas)
+     ──▶ erro permanente?      ──▶ DLQ direto (1 tentativa)
+     ──▶ erro transitorio?     ──▶ retry 2s, 4s ──▶ DLQ se esgotar
+     ──▶ sucesso               ──▶ segue
+                                    │
+                    a DLQ confirmou a escrita?
+                           │                │
+                          sim              nao
+                           │                │
+                           ▼                ▼
+                   commit do offset   offset fica onde esta,
+                                      mensagem volta no proximo poll
+```
+
+O backoff (2s, 4s) fica muito abaixo dos 5 minutos de
+`max.poll.interval.ms` de propósito.
+
+Sobre o `set` de `PEDIDOS_APLICADOS`: ele é um **marcador didático de onde a
+idempotência entra**, não uma garantia completa. Cobre a duplicação dentro do
+mesmo processo (após um rebalanceamento, por exemplo), mas não o caso que mais
+motiva a idempotência — o processo morrer entre o `processar()` e o `commit()`,
+porque aí o `set` morre junto. Idempotência real exige estado **durável**: uma
+constraint de unicidade no banco de inventário, tipicamente.
+
+Para as duas trilhas de erro acontecerem de verdade, há falhas simuladas,
+todas ajustáveis pelo compose:
+
+| Variável | Onde | Efeito |
+|---|---|---|
+| `PCT_FORA_DE_CATALOGO` | producer | % de pedidos com produto inexistente → erro **permanente** |
+| `FALHA_TRANSITORIA_PCT` | estoque | % de consultas ao inventário que falham → erro **transitório** |
+| `MAX_TENTATIVAS` | estoque | quantas tentativas antes da DLQ |
+
+Zerar as duas primeiras desliga as falhas e mostra só o fluxo feliz.
+
+Note que os produtos fora de catálogo **só** são erro para o estoque. Os
+outros 4 consumers processam essas mensagens normalmente — um produto
+desconhecido é problema de quem mantém inventário, não de quem notifica ou
+audita. É o mesmo evento com criticidade diferente por serviço.
+
+#### Vendo a DLQ
+
+```powershell
+docker compose logs -f consumer_estoque
+```
+
+Procure pelas linhas `>>> DLQ:` e pelas de `tentativa N/3 falhou`.
+
+Para ler as mensagens estacionadas, com os headers de diagnóstico:
+
+```powershell
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic reservas-pedido.dlq --from-beginning --property print.headers=true
+```
+
 ## Comandos para observar
 
 Atribuição real de partições por grupo — a coluna `PARTITION` ao lado de cada

@@ -82,6 +82,9 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       TOPIC_NAME: reservas-pedido
+      # % de pedidos com produto fora do catalogo do estoque, para exercitar
+      # o caminho de erro permanente -> DLQ. 0 desliga.
+      PCT_FORA_DE_CATALOGO: "10"
     restart: unless-stopped
 
   consumer_notificacao_cliente:
@@ -140,6 +143,12 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       TOPIC_NAME: reservas-pedido
       GROUP_ID: grupo-estoque
+      # Unico consumer com commit manual + dead letter queue.
+      DLQ_TOPIC: reservas-pedido.dlq
+      MAX_TENTATIVAS: "3"
+      # % de consultas ao "banco de inventario" que falham, para exercitar o
+      # caminho de erro transitorio -> retry. 0 desliga.
+      FALHA_TRANSITORIA_PCT: "15"
     restart: unless-stopped
 
   consumer_analytics:
