@@ -129,6 +129,10 @@ services:
     build:
       context: .
       dockerfile: consumer_estoque/Dockerfile
+      # Unico servico com Dockerfile multi-stage. O alvo e explicito por
+      # clareza: sem "target" o Docker usaria o ultimo estagio, que e este
+      # mesmo, mas deixar escrito evita surpresa se a ordem mudar.
+      target: runtime
     image: protocolo/estoque:dev
     profiles: ["apps"]
     # 1 instancia DE PROPOSITO: o dict ESTOQUE vive na memoria do processo.

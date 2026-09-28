@@ -203,6 +203,130 @@ Na pratica nao precisa rodar isso na mao — `docker compose --profile apps up
 -d --build` constroi as 6 imagens. O `.dockerignore` mantem `.venv/` e `data/`
 fora do contexto.
 
+### O build multi-stage do estoque
+
+`consumer_estoque` e o unico com Dockerfile em **tres estagios**, porque e o
+unico com testes:
+
+| Estagio | O que faz |
+|---|---|
+| `base` | instala as dependencias — os outros dois partem daqui, entao o `pip install` roda uma vez so |
+| `test` | copia codigo **e** testes, e executa a suite com `RUN python teste_dlq.py` |
+| `runtime` | copia so o `consumer.py`, **vindo do estagio de teste** |
+
+A linha que amarra tudo:
+
+```dockerfile
+COPY --from=test /app/consumer.py ./
+```
+
+Ela faz duas coisas de uma vez. Primeiro, cria a dependencia que **obriga** o
+estagio `test` a rodar antes — sem ela o BuildKit pularia o estagio de teste,
+porque ele so constroi o que o alvo final precisa. Segundo, garante que o
+arquivo que sobe e exatamente o que passou nos testes.
+
+O resultado e um portao de qualidade: **se um cenario falhar, o build inteiro
+aborta** e nenhuma imagem e produzida.
+
+```
+#11 [test 2/2] RUN python teste_dlq.py
+#11 0.402 7/7 cenarios passaram
+#11 DONE 0.4s
+#12 [runtime 1/2] COPY --from=test /app/consumer.py ./
+```
+
+E com um teste quebrado:
+
+```
+#10     FALHOU: debitou 5, esperado 999
+#10 6/7 cenarios passaram
+#10 ERROR: process "/bin/sh -c python teste_dlq.py" did not complete successfully: exit code: 1
+```
+
+A imagem final nao leva nada de teste — so `consumer.py` e
+`requirements.txt`. Como uma imagem nao se abre como um zip, a forma pratica
+de conferir e subir um container descartavel so para listar o diretorio:
+
+```powershell
+docker run --rm --entrypoint sh protocolo/estoque:dev -c "ls -la /app"
+```
+
+O `--rm` apaga o container assim que ele termina. O `--entrypoint sh` e
+necessario porque esta imagem define um `ENTRYPOINT` — veja a secao abaixo.
+
+Para rodar apenas os testes, sem produzir imagem:
+
+```powershell
+docker build -f consumer_estoque/Dockerfile --target test .
+```
+
+## ENTRYPOINT e CMD
+
+As duas instrucoes definem o que roda quando o container sobe. A diferenca
+esta em como argumentos do `docker run` interagem com elas:
+
+| | Argumentos no `docker run` |
+|---|---|
+| `CMD` | **substituem** o comando |
+| `ENTRYPOINT` | viram **argumentos dele** |
+
+Este projeto tem os dois padroes de proposito, para dar para comparar.
+
+**Os 5 servicos com so `CMD`** (producer, notificacoes, analytics, auditoria):
+
+```dockerfile
+CMD ["python", "consumer.py"]
+```
+
+```powershell
+docker run img                 # -> python consumer.py
+docker run img ls -la /app     # -> ls -la /app      (o CMD e descartado)
+```
+
+Qualquer comando pode ser passado direto. E o mais simples de inspecionar.
+
+**O `consumer_estoque`, com os dois combinados:**
+
+```dockerfile
+ENTRYPOINT ["python"]
+CMD ["consumer.py"]
+```
+
+```powershell
+docker run img                      # -> python consumer.py
+docker run img -c "print(1+1)"      # -> python -c "print(1+1)"
+docker run img ls -la /app          # -> python ls -la /app     (quebra!)
+```
+
+O `ENTRYPOINT` fixa o executavel e o `CMD` vira apenas o argumento padrao. O
+ganho e poder rodar qualquer coisa em Python contra a imagem, no mesmo
+ambiente do servico, util para depurar sem subir o consumer:
+
+```powershell
+docker run --rm protocolo/estoque:dev -c "import consumer; print(consumer.ESTOQUE)"
+docker run --rm protocolo/estoque:dev -c "import consumer; print(consumer.DLQ_TOPIC)"
+```
+
+O custo e o que a terceira linha da tabela mostra: comandos que nao sao Python
+viram argumento do interpretador e falham. Para esses, e preciso trocar o
+entrypoint explicitamente:
+
+```powershell
+docker run --rm --entrypoint sh protocolo/estoque:dev -c "ls -la /app"
+```
+
+**Qual escolher.** `ENTRYPOINT` quando a imagem **e uma ferramenta** e o
+container deve se comportar como um executavel, o caso das imagens de CLI,
+onde voce passa flags direto. So `CMD` quando a imagem e **um servico que voce
+quer poder abrir para inspecionar** sem flag extra.
+
+Para estes 6 servicos, so `CMD` seria a escolha pragmatica. O estoque usa a
+combinacao porque este repositorio e didatico e vale ter o contraste
+disponivel.
+
+Os outros 5 servicos seguem com Dockerfile de estagio unico: sem testes, um
+estagio `test` seria vazio.
+
 ## Notas
 
 - `CLUSTER_ID` esta fixo no compose de proposito: assim o volume `kafka_data`
